@@ -12,10 +12,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("/Census2022sample_F19.csv")
-
-from google.colab import drive
-drive.mount('/content/drive')
+df = pd.read_csv("Census2022sample_F19.csv")
 
 print("Initial shape: ", df.shape)
 print(df.head())
