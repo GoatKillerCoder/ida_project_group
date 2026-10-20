@@ -35,9 +35,30 @@ st.caption("IDA Project | Data cleaning, exploration and visualisation")
 CSV_PATH = Path(__file__).parent / "Census2022sample_F19.csv"
 
 
-@st.cache_data
+MAX_SAMPLE_ROWS = 100_000
+MAX_CATEGORIES = 20
+MAX_CROSSTAB_LEVELS = 30
+MAX_HEATMAP_CELLS = 600
+MAX_STATS_CELLS = 2_000_000
+
+
+# cache_resource avoids pickling/copying the large DataFrame on every rerun;
+# the cached frames are never modified after they are returned.
+@st.cache_resource(show_spinner="Loading dataset...")
 def load_data(file_path):
-    return pd.read_csv(file_path)
+    last_error = None
+
+    for encoding in ("utf-8-sig", "latin-1"):
+        try:
+            return pd.read_csv(
+                file_path,
+                encoding=encoding,
+                low_memory=False
+            )
+        except UnicodeDecodeError as error:
+            last_error = error
+
+    raise last_error
 
 
 try:
@@ -99,7 +120,7 @@ with col3:
     )
 
 with st.expander("Preview original dataset"):
-    st.dataframe(df.head(10), use_container_width=True)
+    st.dataframe(df.head(10), width="stretch")
 
 with st.expander("Original data types and information"):
     info_df = pd.DataFrame({
@@ -108,7 +129,7 @@ with st.expander("Original data types and information"):
         "Non-null values": df.notna().sum().values,
         "Missing values": df.isna().sum().values
     })
-    st.dataframe(info_df, use_container_width=True)
+    st.dataframe(info_df, width="stretch")
 
 
 # --------------------------------------------------
@@ -117,62 +138,79 @@ with st.expander("Original data types and information"):
 
 st.header("2. Data Cleaning")
 
-df.columns = (
-    df.columns.astype(str)
-    .str.strip()
-    .str.lower()
-    .str.replace(" ", "_", regex=False)
-)
+@st.cache_resource(show_spinner="Cleaning data...")
+def clean_data(raw):
+    """Clean the raw census data. Returns (cleaned_df, duplicates_removed)."""
+
+    data = raw.copy()
+
+    data.columns = (
+        data.columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_", regex=False)
+    )
+
+    # 1. Convert text columns that are really numeric BEFORE filling gaps,
+    #    otherwise they would be filled with "Unknown" instead of the median.
+    for col in data.columns:
+        if pd.api.types.is_numeric_dtype(data[col]):
+            continue
+
+        converted = pd.to_numeric(data[col], errors="coerce")
+        original_valid = int(data[col].notna().sum())
+
+        if original_valid and converted.notna().sum() / original_valid >= 0.95:
+            data[col] = converted
+
+    # 2. Fill missing values (median for numeric, "Unknown" otherwise)
+    for col in data.columns:
+        if pd.api.types.is_numeric_dtype(data[col]):
+            median_value = data[col].median()
+
+            if pd.notna(median_value):
+                data[col] = data[col].fillna(median_value)
+        else:
+            data[col] = data[col].fillna("Unknown")
+
+    # 3. Remove duplicate rows
+    duplicates = int(data.duplicated().sum())
+    data = data.drop_duplicates()
+
+    # 4. Validate ranges when the columns exist
+    if "derh_hhage" in data.columns:
+        data = data[data["derh_hhage"].between(0, 100)]
+
+    if "derh_hsize" in data.columns:
+        data = data[data["derh_hsize"].between(1, 20)]
+
+    data = data.copy()
+
+    # 5. Convert household head sex codes to labels
+    if "derh_hhsex" in data.columns:
+        data["derh_hhsex"] = (
+            data["derh_hhsex"]
+            .replace({1: "Male", 2: "Female"})
+            .astype(str)
+        )
+
+    return data, duplicates
+
 
 initial_rows = len(df)
 
-# Fill missing numeric values using column medians
-numeric_cols = df.select_dtypes(include=[np.number]).columns
+try:
+    df, duplicates_removed = clean_data(df)
+except Exception as error:
+    st.error(f"Data cleaning failed: {error}")
+    st.stop()
 
-for col in numeric_cols:
-    median_value = df[col].median()
-
-    if pd.notna(median_value):
-        df[col] = df[col].fillna(median_value)
-
-# Fill missing categorical values
-categorical_cols = df.select_dtypes(
-    exclude=[np.number]
-).columns
-
-for col in categorical_cols:
-    df[col] = df[col].fillna("Unknown")
-
-# Remove duplicate rows
-duplicates_removed = int(df.duplicated().sum())
-df = df.drop_duplicates().copy()
-
-# Validate household head age when available
-if "derh_hhage" in df.columns:
-    df["derh_hhage"] = pd.to_numeric(
-        df["derh_hhage"], errors="coerce"
+if df.empty:
+    st.error(
+        "No rows remain after cleaning. "
+        "Check the validation rules against the dataset."
     )
-
-    df = df[
-        df["derh_hhage"].between(0, 100)
-    ].copy()
-
-# Validate household size when available
-if "derh_hsize" in df.columns:
-    df["derh_hsize"] = pd.to_numeric(
-        df["derh_hsize"], errors="coerce"
-    )
-
-    df = df[
-        df["derh_hsize"].between(1, 20)
-    ].copy()
-
-# Convert household head sex codes to labels
-if "derh_hhsex" in df.columns:
-    df["derh_hhsex"] = df["derh_hhsex"].replace({
-        1: "Male",
-        2: "Female"
-    })
+    st.stop()
 
 st.success("Data cleaning completed.")
 
@@ -191,12 +229,24 @@ with col3:
     st.metric("Duplicates removed", f"{duplicates_removed:,}")
 
 with st.expander("Cleaned dataset preview"):
-    st.dataframe(df.head(20), use_container_width=True)
+    st.dataframe(df.head(20), width="stretch")
 
 with st.expander("Summary statistics"):
+    stats_source = df
+
+    if df.size > MAX_STATS_CELLS:
+        stats_source = df.sample(
+            n=max(1, MAX_STATS_CELLS // max(1, df.shape[1])),
+            random_state=42
+        )
+        st.caption(
+            f"Dataset is large; statistics are based on a random "
+            f"sample of {len(stats_source):,} rows."
+        )
+
     st.dataframe(
-        df.describe(include="all").T,
-        use_container_width=True
+        stats_source.describe(include="all").T,
+        width="stretch"
     )
 
 with st.expander("Remaining missing values"):
@@ -204,7 +254,7 @@ with st.expander("Remaining missing values"):
         "Missing values"
     ).to_frame()
 
-    st.dataframe(missing_df, use_container_width=True)
+    st.dataframe(missing_df, width="stretch")
 
 
 # --------------------------------------------------
@@ -237,11 +287,45 @@ def show_count_chart(
         )
         return
 
+    if hue is not None and hue not in data.columns:
+        hue = None
+
+    # Aggregate first so only a small table is plotted, not every row
+    keys = [column] if hue is None else [column, hue]
+    counts = data.groupby(keys, observed=True).size().rename("count")
+    counts = counts.reset_index()
+
+    top_x = (
+        counts.groupby(column)["count"].sum()
+        .nlargest(MAX_CATEGORIES).index
+    )
+    counts = counts[counts[column].isin(top_x)]
+
+    if hue is not None:
+        top_hue = (
+            counts.groupby(hue)["count"].sum()
+            .nlargest(MAX_CATEGORIES // 2).index
+        )
+        counts = counts[counts[hue].isin(top_hue)]
+
+    counts = counts.sort_values(keys)
+    counts[column] = counts[column].astype(str)
+
+    if hue is not None:
+        counts[hue] = counts[hue].astype(str)
+
+    if data[column].nunique() > MAX_CATEGORIES:
+        st.caption(
+            f"Showing the {MAX_CATEGORIES} most frequent values of "
+            f"'{column}'."
+        )
+
     fig, ax = plt.subplots(figsize=figsize)
 
-    sns.countplot(
-        data=data,
+    sns.barplot(
+        data=counts,
         x=column,
+        y="count",
         hue=hue,
         ax=ax
     )
@@ -283,12 +367,19 @@ def show_histogram(
         )
         return
 
+    if len(values) > MAX_SAMPLE_ROWS:
+        values = values.sample(MAX_SAMPLE_ROWS, random_state=42)
+        st.caption(
+            f"Histogram based on a random sample of "
+            f"{MAX_SAMPLE_ROWS:,} rows."
+        )
+
     fig, ax = plt.subplots(figsize=(9, 5))
 
     sns.histplot(
         values,
         bins=bins,
-        kde=(len(values) > 1 and values.nunique() > 1),
+        kde=(len(values) <= 20_000 and values.nunique() > 1),
         ax=ax
     )
 
@@ -311,33 +402,57 @@ def show_crosstab(data, row, column, title):
         )
         return
 
-    table = pd.crosstab(data[row], data[column])
+    subset = data[[row, column]].dropna()
+    truncated = False
+
+    for col in (row, column):
+        levels = subset[col].value_counts()
+
+        if len(levels) > MAX_CROSSTAB_LEVELS:
+            keep = levels.nlargest(MAX_CROSSTAB_LEVELS).index
+            subset = subset[subset[col].isin(keep)]
+            truncated = True
+
+    table = pd.crosstab(subset[row], subset[column])
 
     st.subheader(title)
-    st.dataframe(table, use_container_width=True)
 
-    if not table.empty:
-        fig, ax = plt.subplots(
-            figsize=(
-                max(7, min(14, table.shape[1] + 4)),
-                max(4, min(9, table.shape[0] * 0.4 + 2))
-            )
+    if truncated:
+        st.caption(
+            f"Limited to the {MAX_CROSSTAB_LEVELS} most frequent "
+            "values of each variable."
         )
 
-        sns.heatmap(
-            table,
-            annot=(table.size <= 100),
-            fmt="g",
-            cmap="Blues",
-            ax=ax
+    st.dataframe(table, width="stretch")
+
+    if table.empty:
+        return
+
+    if table.size > MAX_HEATMAP_CELLS:
+        st.caption("Heatmap skipped because the table is too large.")
+        return
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(7, min(14, table.shape[1] + 4)),
+            max(4, min(9, table.shape[0] * 0.4 + 2))
         )
+    )
 
-        ax.set_xlabel(column)
-        ax.set_ylabel(row)
+    sns.heatmap(
+        table,
+        annot=(table.size <= 100),
+        fmt="g",
+        cmap="Blues",
+        ax=ax
+    )
 
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+    ax.set_xlabel(column)
+    ax.set_ylabel(row)
+
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
 
 
 # --------------------------------------------------
@@ -394,7 +509,7 @@ with tab1:
             .value_counts(dropna=False)
             .rename_axis("Sex")
             .reset_index(name="Count"),
-            use_container_width=True
+            width="stretch"
         )
 
 
@@ -437,7 +552,7 @@ with tab2:
             .value_counts(dropna=False)
             .rename_axis("Water Piped Code")
             .reset_index(name="Count"),
-            use_container_width=True
+            width="stretch"
         )
 
     show_crosstab(
@@ -503,7 +618,7 @@ if all(
         .reset_index()
     )
 
-    st.dataframe(mean_size, use_container_width=True)
+    st.dataframe(mean_size, width="stretch")
 
     fig, ax = plt.subplots(figsize=(8, 4))
 
@@ -541,7 +656,7 @@ if all(
         .reset_index()
     )
 
-    st.dataframe(mean_age, use_container_width=True)
+    st.dataframe(mean_age, width="stretch")
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
@@ -573,7 +688,12 @@ else:
 
 st.header("5. Download Cleaned Dataset")
 
-csv_data = df.to_csv(index=False).encode("utf-8")
+@st.cache_resource(show_spinner="Preparing download...")
+def to_csv_bytes(data):
+    return data.to_csv(index=False).encode("utf-8")
+
+
+csv_data = to_csv_bytes(df)
 
 st.download_button(
     label="Download cleaned CSV",
